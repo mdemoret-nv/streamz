@@ -1,4 +1,5 @@
 from __future__ import absolute_import, division, print_function
+import asyncio
 from collections import deque, defaultdict
 from datetime import timedelta
 import functools
@@ -426,7 +427,7 @@ class Stream(APIRegisterMixin):
 
         return output._ipython_display_(**kwargs)
 
-    def _emit(self, x, metadata=None):
+    async def _emit(self, x, metadata=None):
         """
         Push data into the stream at this point
 
@@ -450,7 +451,7 @@ class Stream(APIRegisterMixin):
 
         result = []
         for downstream in list(self.downstreams):
-            r = downstream.update(x, who=self, metadata=metadata)
+            r = await downstream.update(x, who=self, metadata=metadata)
 
             if type(r) is list:
                 result.extend(r)
@@ -501,8 +502,8 @@ class Stream(APIRegisterMixin):
                 raise gen.Return(result)
             sync(self.loop, _)
 
-    def update(self, x, who=None, metadata=None):
-        return self._emit(x, metadata=metadata)
+    async def update(self, x, who=None, metadata=None):
+        return await self._emit(x, metadata=metadata)
 
     def gather(self):
         """ This is a no-op for core streamz
@@ -710,14 +711,18 @@ class map(Stream):
 
         Stream.__init__(self, upstream, stream_name=stream_name)
 
-    def update(self, x, who=None, metadata=None):
+    async def update(self, x, who=None, metadata=None):
         try:
             result = self.func(x, *self.args, **self.kwargs)
+
+            if (asyncio.iscoroutine(result)):
+                result = await result
+
         except Exception as e:
             logger.exception(e)
             raise
         else:
-            return self._emit(result, metadata=metadata)
+            return await self._emit(result, metadata=metadata)
 
 
 @Stream.register_api()
@@ -755,7 +760,7 @@ class starmap(Stream):
 
         Stream.__init__(self, upstream, stream_name=stream_name)
 
-    def update(self, x, who=None, metadata=None):
+    async def update(self, x, who=None, metadata=None):
         y = x + self.args
         try:
             result = self.func(*y, **self.kwargs)
@@ -763,7 +768,7 @@ class starmap(Stream):
             logger.exception(e)
             raise
         else:
-            return self._emit(result, metadata=metadata)
+            return await self._emit(result, metadata=metadata)
 
 
 def _truthy(x):
@@ -805,9 +810,9 @@ class filter(Stream):
 
         Stream.__init__(self, upstream, stream_name=stream_name)
 
-    def update(self, x, who=None, metadata=None):
+    async def update(self, x, who=None, metadata=None):
         if self.predicate(x, *self.args, **self.kwargs):
-            return self._emit(x, metadata=metadata)
+            return await self._emit(x, metadata=metadata)
 
 
 @Stream.register_api()
@@ -887,13 +892,13 @@ class accumulate(Stream):
         self.with_state = kwargs.pop('with_state', False)
         Stream.__init__(self, upstream, stream_name=stream_name)
 
-    def update(self, x, who=None, metadata=None):
+    async def update(self, x, who=None, metadata=None):
         if self.state is no_default:
             self.state = x
             if self.with_state:
-                return self._emit((self.state, x), metadata=metadata)
+                return await self._emit((self.state, x), metadata=metadata)
             else:
-                return self._emit(x, metadata=metadata)
+                return await self._emit(x, metadata=metadata)
         else:
             try:
                 result = self.func(self.state, x, **self.kwargs)
@@ -906,9 +911,9 @@ class accumulate(Stream):
                 state = result
             self.state = state
             if self.with_state:
-                return self._emit((self.state, result), metadata=metadata)
+                return await self._emit((self.state, result), metadata=metadata)
             else:
-                return self._emit(result, metadata=metadata)
+                return await self._emit(result, metadata=metadata)
 
 
 @Stream.register_api()
@@ -947,9 +952,9 @@ class slice(Stream):
         Stream.__init__(self, upstream, stream_name=stream_name)
         self._check_end()
 
-    def update(self, x, who=None, metadata=None):
+    async def update(self, x, who=None, metadata=None):
         if self.state >= self.star and self.state % self.step == 0:
-            self.emit(x, metadata=metadata)
+            await self.emit(x, metadata=metadata)
         self.state += 1
         self._check_end()
 
@@ -1028,8 +1033,7 @@ class partition(Stream):
         yield self._emit(tuple(result), list(metadata_result))
         self._release_refs(metadata_result)
 
-    @gen.coroutine
-    def update(self, x, who=None, metadata=None):
+    async def update(self, x, who=None, metadata=None):
         self._retain_refs(metadata)
         key = self._get_key(x)
         buffer = self._buffer[key]
@@ -1042,7 +1046,7 @@ class partition(Stream):
         if len(buffer) == self.n:
             if self._timeout is not None and self.n > 1:
                 self._callbacks[key].cancel()
-            yield self._flush(key)
+            await self._flush(key)
             return
         if len(buffer) == 1 and self._timeout is not None:
             self._callbacks[key] = self.loop.call_later(
@@ -1127,7 +1131,7 @@ class partition_unique(Stream):
         else:
             return x[self.key]
 
-    def update(self, x, who=None, metadata=None):
+    async def update(self, x, who=None, metadata=None):
         self._retain_refs(metadata)
         y = self._get_key(x)
         if self.keep == "last":
@@ -1144,7 +1148,7 @@ class partition_unique(Stream):
         if len(self._buffer) == self.n:
             result, self._buffer = tuple(self._buffer.values()), {}
             metadata_result, self._metadata_buffer = list(self._metadata_buffer.values()), {}
-            ret = self._emit(result, metadata_result)
+            ret = await self._emit(result, metadata_result)
             self._release_refs(metadata_result)
             return ret
         else:
@@ -1184,7 +1188,7 @@ class sliding_window(Stream):
         self.partial = return_partial
         Stream.__init__(self, upstream, **kwargs)
 
-    def update(self, x, who=None, metadata=None):
+    async def update(self, x, who=None, metadata=None):
         self._retain_refs(metadata)
         self._buffer.append(x)
         if not isinstance(metadata, list):
@@ -1192,7 +1196,7 @@ class sliding_window(Stream):
         self.metadata_buffer.append(metadata)
         if self.partial or len(self._buffer) == self.n:
             flat_metadata = [m for ml in self.metadata_buffer for m in ml]
-            ret = self._emit(tuple(self._buffer), flat_metadata)
+            ret = await self._emit(tuple(self._buffer), flat_metadata)
             if len(self.metadata_buffer) == self.n:
                 completed = self.metadata_buffer.popleft()
                 self._release_refs(completed)
@@ -1229,11 +1233,11 @@ class timed_window(Stream):
 
         self.loop.add_callback(self.cb)
 
-    def update(self, x, who=None, metadata=None):
+    async def update(self, x, who=None, metadata=None):
         self._buffer.append(x)
         self._retain_refs(metadata)
         self.metadata_buffer.append(metadata)
-        return self.last
+        return await self.last
 
     @gen.coroutine
     def cb(self):
@@ -1337,7 +1341,7 @@ class timed_window_unique(Stream):
         else:
             return x[self.key]
 
-    def update(self, x, who=None, metadata=None):
+    async def update(self, x, who=None, metadata=None):
         self._retain_refs(metadata)
         y = self._get_key(x)
         if self.keep == "last":
@@ -1351,7 +1355,7 @@ class timed_window_unique(Stream):
             if y not in self._buffer:
                 self._buffer[y] = x
                 self._metadata_buffer[y] = metadata
-        return self.last
+        return await self.last
 
     @gen.coroutine
     def cb(self):
@@ -1391,9 +1395,9 @@ class delay(Stream):
             if duration > 0:
                 yield gen.sleep(duration)
 
-    def update(self, x, who=None, metadata=None):
+    async def update(self, x, who=None, metadata=None):
         self._retain_refs(metadata)
-        return self.queue.put((x, metadata))
+        return await self.queue.put((x, metadata))
 
 
 @Stream.register_api()
@@ -1417,14 +1421,13 @@ class rate_limit(Stream):
         kwargs["ensure_io_loop"] = True
         Stream.__init__(self, upstream, **kwargs)
 
-    @gen.coroutine
-    def update(self, x, who=None, metadata=None):
+    async def update(self, x, who=None, metadata=None):
         now = time()
         old_next = self.next
         self.next = max(now, self.next) + self.interval
         if now < old_next:
-            yield gen.sleep(old_next - now)
-        yield self._emit(x, metadata=metadata)
+            await gen.sleep(old_next - now)
+        await self._emit(x, metadata=metadata)
 
 
 @Stream.register_api()
@@ -1445,9 +1448,9 @@ class buffer(Stream):
 
         self.loop.add_callback(self.cb)
 
-    def update(self, x, who=None, metadata=None):
+    async def update(self, x, who=None, metadata=None):
         self._retain_refs(metadata)
-        return self.queue.put((x, metadata))
+        return await self.queue.put((x, metadata))
 
     @gen.coroutine
     def cb(self):
@@ -1509,7 +1512,7 @@ class zip(Stream):
 
         return tuple(out)
 
-    def update(self, x, who=None, metadata=None):
+    async def update(self, x, who=None, metadata=None):
         self._retain_refs(metadata)
         L = self.buffers[who]  # get buffer for stream
         L.append((x, metadata))
@@ -1522,11 +1525,11 @@ class zip(Stream):
             if self.literals:
                 tup = self.pack_literals(tup)
             md = [m for ml in md for m in ml]
-            ret = self._emit(tup, md)
+            ret = await self._emit(tup, md)
             self._release_refs(md)
             return ret
         elif len(L) > self.maxsize:
-            return self.condition.wait()
+            return await self.condition.wait()
 
 
 @Stream.register_api()
@@ -1592,7 +1595,7 @@ class combine_latest(Stream):
         if self._initial_emit_on is None:
             self.emit_on = self.upstreams
 
-    def update(self, x, who=None, metadata=None):
+    async def update(self, x, who=None, metadata=None):
         self._retain_refs(metadata)
         idx = self.upstreams.index(who)
         if self.metadata[idx]:
@@ -1606,7 +1609,7 @@ class combine_latest(Stream):
         if not self.missing and who in self.emit_on:
             tup = tuple(self.last)
             md = [m for ml in self.metadata for m in ml]
-            return self._emit(tup, md)
+            return await self._emit(tup, md)
 
 
 @Stream.register_api()
@@ -1631,13 +1634,13 @@ class flatten(Stream):
     --------
     partition
     """
-    def update(self, x, who=None, metadata=None):
+    async def update(self, x, who=None, metadata=None):
         L = []
         for i, item in enumerate(x):
             if i == len(x) - 1:
-                y = self._emit(item, metadata=metadata)
+                y = await self._emit(item, metadata=metadata)
             else:
-                y = self._emit(item)
+                y = await self._emit(item)
             if type(y) is list:
                 L.extend(y)
             else:
@@ -1693,7 +1696,7 @@ class unique(Stream):
 
         Stream.__init__(self, upstream, **kwargs)
 
-    def update(self, x, who=None, metadata=None):
+    async def update(self, x, who=None, metadata=None):
         y = self.key(x)
         emit = True
         if isinstance(self.seen, list):
@@ -1704,11 +1707,11 @@ class unique(Stream):
             if self.maxsize:
                 del self.seen[self.maxsize:]
             if emit:
-                return self._emit(x, metadata=metadata)
+                return await self._emit(x, metadata=metadata)
         else:
             if self.seen.get(y, '~~not_seen~~') == '~~not_seen~~':
                 self.seen[y] = 1
-                return self._emit(x, metadata=metadata)
+                return await self._emit(x, metadata=metadata)
 
 
 @Stream.register_api()
@@ -1727,8 +1730,8 @@ class union(Stream):
     def __init__(self, *upstreams, **kwargs):
         super(union, self).__init__(upstreams=upstreams, **kwargs)
 
-    def update(self, x, who=None, metadata=None):
-        return self._emit(x, metadata=metadata)
+    async def update(self, x, who=None, metadata=None):
+        return await self._emit(x, metadata=metadata)
 
 
 @Stream.register_api()
@@ -1762,12 +1765,12 @@ class pluck(Stream):
         self.pick = pick
         super(pluck, self).__init__(upstream, **kwargs)
 
-    def update(self, x, who=None, metadata=None):
+    async def update(self, x, who=None, metadata=None):
         if isinstance(self.pick, list):
-            return self._emit(tuple([x[ind] for ind in self.pick]),
+            return await self._emit(tuple([x[ind] for ind in self.pick]),
                               metadata=metadata)
         else:
-            return self._emit(x[self.pick], metadata=metadata)
+            return await self._emit(x[self.pick], metadata=metadata)
 
 
 @Stream.register_api()
@@ -1799,7 +1802,7 @@ class collect(Stream):
 
         Stream.__init__(self, upstream, **kwargs)
 
-    def update(self, x, who=None, metadata=None):
+    async def update(self, x, who=None, metadata=None):
         self._retain_refs(metadata)
         self.cache.append(x)
         if metadata:
@@ -1842,7 +1845,7 @@ class zip_latest(Stream):
         self.lossless_buffer = deque()
         Stream.__init__(self, upstreams=upstreams, **kwargs)
 
-    def update(self, x, who=None, metadata=None):
+    async def update(self, x, who=None, metadata=None):
         self._retain_refs(metadata)
         idx = self.upstreams.index(who)
         if who is self.lossless:
@@ -1861,7 +1864,7 @@ class zip_latest(Stream):
                 md = [m for ml in self.metadata for m in ml]
                 L.append(self._emit(tuple(self.last), md))
                 self._release_refs(self.metadata[0])
-            return L
+            return await asyncio.gather(*L) 
 
 
 @Stream.register_api()
@@ -1890,7 +1893,7 @@ class latest(Stream):
 
         self.loop.add_callback(self.cb)
 
-    def update(self, x, who=None, metadata=None):
+    async def update(self, x, who=None, metadata=None):
         if self.next_metadata:
             self._release_refs(self.next_metadata)
         self._retain_refs(metadata)
@@ -1957,7 +1960,7 @@ class to_kafka(Stream):
             self.producer.poll(0)
             yield gen.sleep(self.polltime)
 
-    def update(self, x, who=None, metadata=None):
+    async def update(self, x, who=None, metadata=None):
         future = gen.Future()
         self.futures.append(future)
 
@@ -1975,7 +1978,7 @@ class to_kafka(Stream):
                     return
 
         self.loop.add_callback(_)
-        return future
+        return await future
 
     @gen.coroutine
     def cb(self, err, msg):

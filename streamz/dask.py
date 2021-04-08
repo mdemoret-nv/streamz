@@ -6,6 +6,8 @@ from tornado import gen
 
 from dask.compatibility import apply
 from distributed.client import default_client
+import distributed
+from tqdm.std import tqdm
 
 from .core import Stream
 from . import core, sources
@@ -51,10 +53,43 @@ class map(DaskStream):
 
         DaskStream.__init__(self, upstream)
 
+    async def update(self, x, who=None, metadata=None):
+        client = default_client()
+        # tqdm.write("Scheduling Dask Map: {}".format(x))
+        result: distributed.Future = client.submit(self.func, x, *self.args, **self.kwargs)
+        # result.add_done_callback(lambda y: tqdm.write("Dask Map Complete: {}".format(x)))
+        # tqdm.write("Scheduled Dask Map: {}".format(x))
+        return await self._emit(result, metadata=metadata)
+
+
+@DaskStream.register_api()
+class filter(DaskStream):
+    def __init__(self, upstream, predicate, *args, **kwargs):
+        if predicate is None:
+            predicate = _truthy
+        self.predicate = predicate
+        stream_name = kwargs.pop("stream_name", None)
+        self.kwargs = kwargs
+        self.args = args
+
+        DaskStream.__init__(self, upstream, stream_name=stream_name)
+
+    @gen.coroutine
     def update(self, x, who=None, metadata=None):
         client = default_client()
-        result = client.submit(self.func, x, *self.args, **self.kwargs)
-        return self._emit(result, metadata=metadata)
+
+        try:
+            self._retain_refs(metadata)
+            
+            result = yield client.submit(self.predicate, x, *self.args, **self.kwargs)
+
+            if result:
+                r = yield self._emit(x, metadata=metadata)
+
+                return r
+        finally:
+
+            self._release_refs(metadata)
 
 
 @DaskStream.register_api()
@@ -68,13 +103,13 @@ class accumulate(DaskStream):
         self.with_state = kwargs.pop('with_state', False)
         DaskStream.__init__(self, upstream)
 
-    def update(self, x, who=None, metadata=None):
+    async def update(self, x, who=None, metadata=None):
         if self.state is core.no_default:
             self.state = x
             if self.with_state:
-                return self._emit((self.state, x), metadata=metadata)
+                return await self._emit((self.state, x), metadata=metadata)
             else:
-                return self._emit(x, metadata=metadata)
+                return await self._emit(x, metadata=metadata)
         else:
             client = default_client()
             result = client.submit(self.func, self.state, x, **self.kwargs)
@@ -85,9 +120,9 @@ class accumulate(DaskStream):
                 state = result
             self.state = state
             if self.with_state:
-                return self._emit((self.state, result), metadata=metadata)
+                return await self._emit((self.state, result), metadata=metadata)
             else:
-                return self._emit(result, metadata=metadata)
+                return await self._emit(result, metadata=metadata)
 
 
 @core.Stream.register_api()
@@ -97,8 +132,7 @@ class scatter(DaskStream):
 
     All elements flowing through the input will be scattered out to the cluster
     """
-    @gen.coroutine
-    def update(self, x, who=None, metadata=None):
+    async def update(self, x, who=None, metadata=None):
         client = default_client()
 
         self._retain_refs(metadata)
@@ -107,12 +141,12 @@ class scatter(DaskStream):
         # lists and dicts. So we always use a list here to be sure
         # we know the format exactly. We do not use a key to avoid
         # issues like https://github.com/python-streamz/streams/issues/397.
-        future_as_list = yield client.scatter([x], asynchronous=True, hash=False)
+        future_as_list = await client.scatter([x], asynchronous=True, hash=False)
         future = future_as_list[0]
-        f = yield self._emit(future, metadata=metadata)
+        f = await self._emit(future, metadata=metadata)
         self._release_refs(metadata)
 
-        raise gen.Return(f)
+        return f
 
 
 @DaskStream.register_api()
@@ -133,16 +167,15 @@ class gather(core.Stream):
     buffer
     scatter
     """
-    @gen.coroutine
-    def update(self, x, who=None, metadata=None):
+    async def update(self, x, who=None, metadata=None):
         client = default_client()
 
         self._retain_refs(metadata)
-        result = yield client.gather(x, asynchronous=True)
-        result2 = yield self._emit(result, metadata=metadata)
+        result = await client.gather(x, asynchronous=True)
+        result2 = await self._emit(result, metadata=metadata)
         self._release_refs(metadata)
 
-        raise gen.Return(result2)
+        return result2
 
 
 @DaskStream.register_api()
@@ -154,11 +187,14 @@ class starmap(DaskStream):
 
         DaskStream.__init__(self, upstream, stream_name=stream_name)
 
-    def update(self, x, who=None, metadata=None):
+    async def update(self, x, who=None, metadata=None):
         client = default_client()
         result = client.submit(apply, self.func, x, self.kwargs)
-        return self._emit(result, metadata=metadata)
+        return await self._emit(result, metadata=metadata)
 
+@DaskStream.register_api()
+class flatten(DaskStream, core.flatten):
+    pass
 
 @DaskStream.register_api()
 class buffer(DaskStream, core.buffer):

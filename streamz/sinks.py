@@ -1,5 +1,6 @@
 import inspect
 import weakref
+import asyncio
 
 from tornado import gen
 
@@ -64,12 +65,13 @@ class sink(Sink):
         self.args = args
         super().__init__(upstream, **stream_kwargs)
 
-    def update(self, x, who=None, metadata=None):
+    async def update(self, x, who=None, metadata=None):
         result = self.func(x, *self.args, **self.kwargs)
-        if gen.isawaitable(result):
-            return result
-        else:
-            return []
+
+        if (asyncio.iscoroutine(result)):
+            result = await result
+
+        return result
 
 
 @Stream.register_api()
