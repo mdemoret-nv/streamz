@@ -37,14 +37,28 @@ class Source(Stream):
     def __init__(self, start=False, **kwargs):
         self.stopped = True
         super().__init__(ensure_io_loop=True, **kwargs)
+
+        self._on_start_callbacks = []
+        self._on_stop_callbacks = []
+
         self.started = False
         if start:
             self.start()
+
+    def add_on_start_callback(self, cb):
+        self._on_start_callbacks.append(cb)
+
+    def add_on_stop_callback(self, cb):
+        self._on_stop_callbacks.append(cb)
 
     def stop(self):
         """set self.stopped, which will cause polling to stop after next run"""
         if not self.stopped:
             self.stopped = True
+
+            # Now schedule any on_stop callbacks
+            for cb in self._on_stop_callbacks:
+                self.loop.add_callback(cb)
 
     def start(self):
         """start polling
@@ -55,6 +69,12 @@ class Source(Stream):
         if self.stopped:
             self.stopped = False
             self.started = True
+
+            # Now schedule any on_start callbacks
+            for cb in self._on_start_callbacks:
+                self.loop.add_callback(cb)
+            
+            # Schedule the main loop
             self.loop.add_callback(self.run)
 
     async def run(self):
@@ -342,9 +362,10 @@ class from_process(Source):
         Whether to immediately startup the process. Usually you want to connect
         downstream nodes first, and then call ``.start()``.
 
-    Example
-    -------
+    Examples
+    --------
     >>> source = Source.from_process(['ping', 'localhost'])  # doctest: +SKIP
+    
     """
 
     def __init__(self, cmd, open_kwargs=None, with_stderr=False, with_end=True,
@@ -630,7 +651,7 @@ def from_kafka_batched(topic, consumer_params, poll_interval='1s',
     npartitions: int (None)
         | Number of partitions in the topic.
         | If None, streamz will poll Kafka to get the number of partitions.
-     refresh_partitions: bool (False)
+    refresh_partitions: bool (False)
         | Useful if the user expects to increase the number of topic partitions on the
         | fly, maybe to handle spikes in load. Streamz polls Kafka in every batch to
         | determine the current number of partitions. If partitions have been added,
@@ -674,7 +695,7 @@ def from_kafka_batched(topic, consumer_params, poll_interval='1s',
     the earliest offsets.
 
     Examples
-    ----------
+    --------
 
     >>> source = Stream.from_kafka_batched('mytopic',
     ...           {'bootstrap.servers': 'localhost:9092',
