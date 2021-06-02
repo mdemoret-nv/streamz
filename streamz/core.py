@@ -271,8 +271,8 @@ class Stream(APIRegisterMixin):
             if upstream:
                 upstream.downstreams.add(self)
 
-    def _set_loop(self, loop):
-        self.loop = None
+    def _set_loop(self, loop: IOLoop):
+        self.loop: IOLoop = None
         if loop is not None:
             self._inform_loop(loop)
         else:

@@ -2,6 +2,7 @@ import asyncio
 from glob import glob
 import os
 import time
+import typing
 from tornado import gen
 import weakref
 
@@ -60,6 +61,7 @@ class Source(Stream):
             for cb in self._on_stop_callbacks:
                 self.loop.add_callback(cb)
 
+    @typing.final
     def start(self):
         """start polling
 
@@ -451,19 +453,14 @@ class from_kafka(Source):
             if msg and msg.value() and msg.error() is None:
                 return msg.value()
 
-    @gen.coroutine
-    def poll_kafka(self):
-        while True:
-            val = self.do_poll()
-            if val:
-                yield self._emit(val)
-            else:
-                yield gen.sleep(self.poll_interval)
-            if self.stopped:
-                break
-        self._close_consumer()
+    async def _run(self):
+        val = self.do_poll()
+        if val:
+            await self._emit(val)
+        else:
+            await asyncio.sleep(self.poll_interval)
 
-    def start(self):
+    async def run(self):
         import confluent_kafka as ck
         if self.stopped:
             self.stopped = False
@@ -474,7 +471,12 @@ class from_kafka(Source):
 
             # blocks for consumer thread to come up
             self.consumer.get_watermark_offsets(tp)
-            self.loop.add_callback(self.poll_kafka)
+
+        # Run the parent method
+        await super().run()
+
+        # Ensure we always close the consumer
+        self._close_consumer()
 
     def _close_consumer(self):
         if self.consumer is not None:
@@ -516,8 +518,7 @@ class FromKafkaBatched(Source):
 
         super().__init__(**kwargs)
 
-    @gen.coroutine
-    def poll_kafka(self):
+    async def _run(self):
         import confluent_kafka as ck
 
         def commit(_part):
@@ -525,10 +526,9 @@ class FromKafkaBatched(Source):
             _tp = ck.TopicPartition(topic, part_no, offset + 1)
             self.consumer.commit(offsets=[_tp], asynchronous=True)
 
-        @gen.coroutine
-        def checkpoint_emit(_part):
+        async def checkpoint_emit(_part):
             ref = RefCounter(cb=lambda: commit(_part), loop=self.loop)
-            yield self._emit(_part, metadata=[{'ref': ref}])
+            await self._emit(_part, metadata=[{'ref': ref}])
 
         if self.npartitions is None:
             kafka_cluster_metadata = self.consumer.list_topics(self.topic)
@@ -588,28 +588,30 @@ class FromKafkaBatched(Source):
             self.consumer_params['auto.offset.reset'] = 'earliest'
 
             for part in out:
-                yield self.loop.add_callback(checkpoint_emit, part)
+                self.loop.add_callback(checkpoint_emit, part)
 
             else:
-                yield gen.sleep(self.poll_interval)
+                await asyncio.sleep(self.poll_interval)
 
-    def start(self):
+    async def run(self):
         import confluent_kafka as ck
         if self.engine == "cudf":  # pragma: no cover
             from custreamz import kafka
 
-        if self.stopped:
-            if self.engine == "cudf":  # pragma: no cover
-                self.consumer = kafka.Consumer(self.consumer_params)
-            else:
-                self.consumer = ck.Consumer(self.consumer_params)
-            weakref.finalize(self, lambda consumer=self.consumer: _close_consumer(consumer))
-            self.stopped = False
-            tp = ck.TopicPartition(self.topic, 0, 0)
+        if self.engine == "cudf":  # pragma: no cover
+            self.consumer = kafka.Consumer(self.consumer_params)
+        else:
+            self.consumer = ck.Consumer(self.consumer_params)
+        weakref.finalize(self, lambda consumer=self.consumer: _close_consumer(consumer))
+        tp = ck.TopicPartition(self.topic, 0, 0)
 
-            # blocks for consumer thread to come up
-            self.consumer.get_watermark_offsets(tp)
-            self.loop.add_callback(self.poll_kafka)
+        # blocks for consumer thread to come up
+        self.consumer.get_watermark_offsets(tp)
+
+        await super().run()
+
+        # Ensure we always close the consumer
+        _close_consumer(self.consumer)
 
 
 @Stream.register_api(staticmethod)
