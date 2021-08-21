@@ -1,10 +1,12 @@
 import asyncio
+from collections import deque
 from glob import glob
 import os
 import time
 import typing
 from tornado import gen
 import weakref
+
 
 from .core import Stream, convert_interval, RefCounter
 
@@ -57,10 +59,6 @@ class Source(Stream):
         if not self.stopped:
             self.stopped = True
 
-            # Now schedule any on_stop callbacks
-            for cb in self._on_stop_callbacks:
-                self.loop.add_callback(cb)
-
     @typing.final
     def start(self):
         """start polling
@@ -72,12 +70,58 @@ class Source(Stream):
             self.stopped = False
             self.started = True
 
-            # Now schedule any on_start callbacks
-            for cb in self._on_start_callbacks:
-                self.loop.add_callback(cb)
-            
-            # Schedule the main loop
-            self.loop.add_callback(self.run)
+            self._internal_run_future = gen.convert_yielded(self._internal_run())
+
+    @typing.final
+    async def join(self):
+        # Wait for the internal run future to be completed
+        await self._internal_run_future
+
+    async def _get_iterable(self):
+        raise NotImplementedError
+
+    @typing.final
+    async def _internal_run(self, parallel_level=8):
+
+        running_tasks = deque(maxlen=parallel_level)
+
+        # Now schedule any on_start callbacks
+        for cb in self._on_start_callbacks:
+            self.loop.add_callback(cb)
+
+        iterable = await self._get_iterable()
+
+        async for next_val in iterable:
+
+            # Schedule the emit
+            running_tasks.append(asyncio.ensure_future(self._emit(next_val)))
+
+            # Pop off the queue
+            if (len(running_tasks) == parallel_level):
+                front_future = running_tasks.popleft()
+
+                # Finally await the future
+                await front_future
+
+            # Exit if we are stopped
+            if (self.stopped):
+                break
+
+        # Now finish up the outstanding
+        while (len(running_tasks) > 0):
+            front_future = running_tasks.popleft()
+
+            # Finally await the future
+            await front_future
+
+        # Now we are complete. Call the on stop callbacks
+        for cb in self._on_stop_callbacks:
+            self.loop.add_callback(cb)
+
+        self.stopped = True
+
+    def is_done(self):
+        return self.started and self.stopped
 
     async def run(self):
         """This coroutine will be invoked by start() and emit all data
@@ -90,6 +134,11 @@ class Source(Stream):
         """
         while not self.stopped:
             await self._run()
+
+        # If we have started and we are stopped, release one more ref to cause
+        # an on_complete message
+        if (self.is_done()):
+            self._release_refs([])
 
     async def _run(self):
         """This is the functionality to run on each cycle
@@ -367,7 +416,7 @@ class from_process(Source):
     Examples
     --------
     >>> source = Source.from_process(['ping', 'localhost'])  # doctest: +SKIP
-    
+
     """
 
     def __init__(self, cmd, open_kwargs=None, with_stderr=False, with_end=True,
@@ -772,7 +821,6 @@ def get_message_batch_cudf(kafka_params, topic, partition, keys, low, high, time
         consumer.close()
     return gdf
 
-
 @Stream.register_api(staticmethod)
 class from_iterable(Source):
     """ Emits items from an iterable.
@@ -796,9 +844,83 @@ class from_iterable(Source):
         self._iterable = iterable
         super().__init__(**kwargs)
 
+    async def _get_iterable(self):
+        return self._iterable
+
     async def run(self):
         for x in self._iterable:
             if self.stopped:
                 break
             await asyncio.gather(*self._emit(x))
         self.stopped = True
+
+    async def start_task(self, parallel_level = 10):
+
+        running_tasks = deque(maxlen=parallel_level)
+
+        self.stopped = False
+        self.started = True
+
+        iterator = iter(self._iterable)
+
+        while (not self.stopped):
+
+            try:
+                # Get next iterable value
+                next_val = next(iterator)
+            except StopIteration:
+                break
+
+            # Schedule the emit
+            running_tasks.append(asyncio.ensure_future(self._emit(next_val)))
+
+            # Pop off the queue
+            if (len(running_tasks) == parallel_level):
+                front_future = running_tasks.popleft()
+
+                # Finally await the future
+                await front_future
+
+        # Now finish up the outstanding
+        while (len(running_tasks) > 0):
+            front_future = running_tasks.popleft()
+
+            # Finally await the future
+            await front_future
+
+    async def gen_task2(self, q: asyncio.Queue):
+
+        iterator = iter(self._iterable)
+
+        while (not self.stopped):
+
+            try:
+                # Get next iterable value
+                next_val = next(iterator)
+            except StopIteration:
+                break
+
+            await q.put(asyncio.ensure_future(self._emit(next_val)))
+
+        self.stopped = True
+
+    async def start_task2(self, parallel_level = 10):
+
+        q = asyncio.Queue(maxsize=parallel_level)
+
+        self.stopped = False
+        self.started = True
+
+        asyncio.create_task(self.gen_task2(q))
+
+        while (not self.stopped):
+
+            next_future = await q.get()
+
+            await next_future
+
+        # Now finish up the outstanding
+        while (not q.empty()):
+            next_future = await q.get()
+
+            await next_future

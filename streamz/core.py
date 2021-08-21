@@ -259,6 +259,8 @@ class Stream(APIRegisterMixin):
             self.upstreams = [upstream]
         else:
             self.upstreams = []
+        self._ref_count = 0
+        self._done_callbacks = []
 
         self._set_asynchronous(asynchronous)
         self._set_loop(loop)
@@ -340,6 +342,9 @@ class Stream(APIRegisterMixin):
         """Remove upstream from current upstreams, this method is overridden for
         classes which handle stream specific buffers/caches"""
         self.upstreams.remove(upstream)
+
+    def add_done_callback(self, cb):
+        self._done_callbacks.append(cb)
 
     def start(self):
         """ Start any upstream sources """
@@ -442,27 +447,17 @@ class Stream(APIRegisterMixin):
             A reference counter used to check when data is done
 
         """
-        self.current_value = x
-        self.current_metadata = metadata
-        if metadata:
-            self._retain_refs(metadata, len(self.downstreams))
-        else:
+        if metadata is None:
             metadata = []
 
-        result = []
-        for downstream in list(self.downstreams):
-            r = await downstream.update(x, who=self, metadata=metadata)
+        self._retain_refs(metadata, len(self.downstreams))
 
-            if type(r) is list:
-                result.extend(r)
-            else:
-                result.append(r)
+        for downstream in list(self.downstreams):
+            await downstream.update(x, who=self, metadata=metadata)
 
             self._release_refs(metadata)
 
-        return [element for element in result if element is not None]
-
-    def emit(self, x, asynchronous=False, metadata=None):
+    async def emit(self, x, asynchronous=False, metadata=None):
         """ Push data into the stream at this point
 
         This is typically done only at source Streams but can theoretically be
@@ -485,9 +480,7 @@ class Stream(APIRegisterMixin):
             if not ts_async:
                 thread_state.asynchronous = True
             try:
-                result = self._emit(x, metadata=metadata)
-                if self.loop:
-                    return gen.convert_yielded(result)
+                await self._emit(x, metadata=metadata)
             finally:
                 thread_state.asynchronous = ts_async
         else:
@@ -643,7 +636,16 @@ class Stream(APIRegisterMixin):
         from .batch import Batch
         return Batch(stream=self, **kwargs)
 
-    def _retain_refs(self, metadata, n=1):
+    def on_complete(self):
+
+        for cb in self._done_callbacks:
+            cb(self)
+
+        # Decrement all downstreams to trigger possibility of being complete
+        for d in self.downstreams:
+            d._release_refs([])
+
+    def _retain_refs(self, metadata, n=1, ref_count=None):
         """ Retain all references in the provided metadata `n` number of times
 
         Parameters
@@ -656,11 +658,12 @@ class Stream(APIRegisterMixin):
         n: The number of times to retain the provided references
 
         """
-        for m in metadata:
-            if 'ref' in m:
-                m['ref'].retain(n)
+        self._ref_count += n if ref_count is None else ref_count
+        # for m in metadata:
+        #     if 'ref' in m:
+        #         m['ref'].retain(n)
 
-    def _release_refs(self, metadata, n=1):
+    def _release_refs(self, metadata, n=1, ref_count=None):
         """ Release all references in the provided metadata `n` number of times
 
         Parameters
@@ -673,9 +676,14 @@ class Stream(APIRegisterMixin):
         n: The number of times to retain the provided references
 
         """
-        for m in metadata:
-            if 'ref' in m:
-                m['ref'].release(n)
+        # for m in metadata:
+        #     if 'ref' in m:
+        #         m['ref'].release(n)
+        self._ref_count -= n if ref_count is None else ref_count
+
+        # Check for complete
+        if (self._ref_count == -1):
+            self.on_complete()
 
 
 @Stream.register_api()
@@ -1446,18 +1454,18 @@ class buffer(Stream):
         kwargs["ensure_io_loop"] = True
         Stream.__init__(self, upstream, **kwargs)
 
-        self.loop.add_callback(self.cb)
+        # self.loop.add_callback(self.cb)
+        # asyncio.create_task(self.cb())
 
-    async def update(self, x, who=None, metadata=None):
-        self._retain_refs(metadata)
-        return await self.queue.put((x, metadata))
+    # async def update(self, x, who=None, metadata=None):
+    #     self._retain_refs(metadata)
+    #     return await self.queue.put((x, metadata))
 
-    @gen.coroutine
-    def cb(self):
-        while True:
-            x, metadata = yield self.queue.get()
-            yield self._emit(x, metadata=metadata)
-            self._release_refs(metadata)
+    # async def cb(self):
+    #     while True:
+    #         x, metadata = await self.queue.get()
+    #         await self._emit(x, metadata=metadata)
+    #         self._release_refs(metadata)
 
 
 @Stream.register_api()
@@ -1638,14 +1646,11 @@ class flatten(Stream):
         L = []
         for i, item in enumerate(x):
             if i == len(x) - 1:
-                y = await self._emit(item, metadata=metadata)
+                L.append(self._emit(item, metadata=metadata))
             else:
-                y = await self._emit(item)
-            if type(y) is list:
-                L.extend(y)
-            else:
-                L.append(y)
-        return L
+                L.append(self._emit(item))
+
+        return await asyncio.gather(*L)
 
 
 @Stream.register_api()
@@ -1815,7 +1820,7 @@ class collect(Stream):
         out = tuple(self.cache)
         metadata = list(self.metadata_cache)
         self._emit(out, metadata)
-        self._release_refs(metadata)
+        self._release_refs(metadata, ref_count=len(out))
         self.cache.clear()
         self.metadata_cache.clear()
 
@@ -1864,7 +1869,7 @@ class zip_latest(Stream):
                 md = [m for ml in self.metadata for m in ml]
                 L.append(self._emit(tuple(self.last), md))
                 self._release_refs(self.metadata[0])
-            return await asyncio.gather(*L) 
+            return await asyncio.gather(*L)
 
 
 @Stream.register_api()

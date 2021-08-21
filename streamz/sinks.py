@@ -71,7 +71,7 @@ class sink(Sink):
         if (asyncio.iscoroutine(result)):
             result = await result
 
-        return result
+        # return result
 
 
 @Stream.register_api()

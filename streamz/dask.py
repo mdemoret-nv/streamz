@@ -55,10 +55,7 @@ class map(DaskStream):
 
     async def update(self, x, who=None, metadata=None):
         client = default_client()
-        # tqdm.write("Scheduling Dask Map: {}".format(x))
         result: distributed.Future = client.submit(self.func, x, *self.args, **self.kwargs)
-        # result.add_done_callback(lambda y: tqdm.write("Dask Map Complete: {}".format(x)))
-        # tqdm.write("Scheduled Dask Map: {}".format(x))
         return await self._emit(result, metadata=metadata)
 
 
@@ -80,7 +77,7 @@ class filter(DaskStream):
 
         try:
             self._retain_refs(metadata)
-            
+
             result = yield client.submit(self.predicate, x, *self.args, **self.kwargs)
 
             if result:
