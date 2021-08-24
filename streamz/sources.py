@@ -1,5 +1,6 @@
 import asyncio
 from collections import deque
+import functools
 from glob import glob
 import os
 import time
@@ -37,9 +38,11 @@ class Source(Stream):
     """
     _graphviz_shape = 'doubleoctagon'
 
-    def __init__(self, start=False, **kwargs):
+    def __init__(self, start=False, max_concurrent=None, **kwargs):
         self.stopped = True
         super().__init__(ensure_io_loop=True, **kwargs)
+
+        self.max_concurrent = os.cpu_count() if max_concurrent is None else max_concurrent
 
         self._on_start_callbacks = []
         self._on_stop_callbacks = []
@@ -77,48 +80,54 @@ class Source(Stream):
         # Wait for the internal run future to be completed
         await self._internal_run_future
 
-    async def _get_iterable(self):
+    # Main async generator object that should return futures from self._emit(x). Returning futures allows for parallel
+    # execution of multiple futures as well as adding callbacks to cleanup any messages. Can also return coroutines
+    async def _source_generator(self):
         raise NotImplementedError
 
     @typing.final
-    async def _internal_run(self, parallel_level=8):
+    async def _internal_run(self):
 
-        running_tasks = deque(maxlen=parallel_level)
+        running_tasks = deque(maxlen=self.max_concurrent)
 
         # Now schedule any on_start callbacks
         for cb in self._on_start_callbacks:
             self.loop.add_callback(cb)
 
-        iterable = await self._get_iterable()
+        iterable = self._source_generator()
 
-        async for next_val in iterable:
+        try:
+            async for emit_val in iterable:
 
-            # Schedule the emit
-            running_tasks.append(asyncio.ensure_future(self._emit(next_val)))
+                # Ensure the future is scheduled in case its a coroutine
+                running_tasks.append(asyncio.ensure_future(emit_val))
 
-            # Pop off the queue
-            if (len(running_tasks) == parallel_level):
+                # Pop off the queue
+                if (len(running_tasks) == self.max_concurrent):
+                    front_future = running_tasks.popleft()
+
+                    # Finally await the future
+                    await front_future
+
+        finally:
+            # Now finish up the outstanding
+            while (len(running_tasks) > 0):
                 front_future = running_tasks.popleft()
 
                 # Finally await the future
                 await front_future
 
-            # Exit if we are stopped
-            if (self.stopped):
-                break
+            # Now we are complete. Call the on stop callbacks
+            for cb in self._on_stop_callbacks:
+                self.loop.add_callback(cb)
 
-        # Now finish up the outstanding
-        while (len(running_tasks) > 0):
-            front_future = running_tasks.popleft()
+            self.stopped = True
 
-            # Finally await the future
-            await front_future
+            await self._on_completed()
 
-        # Now we are complete. Call the on stop callbacks
-        for cb in self._on_stop_callbacks:
-            self.loop.add_callback(cb)
-
-        self.stopped = True
+    # Called when all emitted futures have completed
+    async def _on_completed(self):
+        pass
 
     def is_done(self):
         return self.started and self.stopped
@@ -168,6 +177,12 @@ class from_periodic(Source):
         self._cb = callback
         self._poll = poll_interval
         super().__init__(**kwargs)
+
+    async def _source_generator(self):
+
+        while (not self.stopped):
+            yield self._emit(self._cb())
+            await asyncio.sleep(self._poll)
 
     async def _run(self):
         await asyncio.gather(*self._emit(self._cb()))
@@ -496,6 +511,32 @@ class from_kafka(Source):
         self.poll_interval = poll_interval
         super().__init__(**kwargs)
 
+    async def _source_generator(self):
+
+        try:
+            import confluent_kafka as ck
+
+            if self.stopped:
+                self.stopped = False
+                self.consumer = ck.Consumer(self.cpars)
+                self.consumer.subscribe(self.topics)
+                weakref.finalize(self, lambda consumer=self.consumer: _close_consumer(consumer))
+                tp = ck.TopicPartition(self.topics[0], 0, 0)
+
+                # blocks for consumer thread to come up
+                self.consumer.get_watermark_offsets(tp)
+
+            while (not self.stopped):
+                val = self.do_poll()
+                if val:
+                    yield self._emit(val)
+                else:
+                    await asyncio.sleep(self.poll_interval)
+
+        finally:
+            self._close_consumer()
+
+
     def do_poll(self):
         if self.consumer is not None:
             msg = self.consumer.poll(0)
@@ -564,8 +605,103 @@ class FromKafkaBatched(Source):
         self.keys = keys
         self.engine = engine
         self.started = False
+        self.consumer = None
 
         super().__init__(**kwargs)
+
+    async def _source_generator(self):
+
+        import confluent_kafka as ck
+        if self.engine == "cudf":  # pragma: no cover
+            from custreamz import kafka
+
+        if self.engine == "cudf":  # pragma: no cover
+            self.consumer = kafka.Consumer(self.consumer_params)
+        else:
+            consumer = ck.Consumer(self.consumer_params)
+        weakref.finalize(self, lambda c=self.consumer: _close_consumer(c))
+        tp = ck.TopicPartition(self.topic, 0, 0)
+
+        # blocks for consumer thread to come up
+        self.consumer.get_watermark_offsets(tp)
+
+        if self.npartitions is None:
+            kafka_cluster_metadata = self.consumer.list_topics(self.topic)
+            if self.engine == "cudf":  # pragma: no cover
+                self.npartitions = len(kafka_cluster_metadata[self.topic.encode('utf-8')])
+            else:
+                self.npartitions = len(kafka_cluster_metadata.topics[self.topic].partitions)
+        self.positions = [0] * self.npartitions
+
+        tps = []
+        for partition in range(self.npartitions):
+            tps.append(ck.TopicPartition(self.topic, partition))
+
+        while True:
+            try:
+                committed = self.consumer.committed(tps, timeout=1)
+            except ck.KafkaException:
+                pass
+            else:
+                for tp in committed:
+                    self.positions[tp.partition] = tp.offset
+                break
+
+        while (not self.stopped):
+            out = []
+
+            if self.refresh_partitions:
+                kafka_cluster_metadata = self.consumer.list_topics(self.topic)
+                if self.engine == "cudf":  # pragma: no cover
+                    new_partitions = len(kafka_cluster_metadata[self.topic.encode('utf-8')])
+                else:
+                    new_partitions = len(kafka_cluster_metadata.topics[self.topic].partitions)
+                if new_partitions > self.npartitions:
+                    self.positions.extend([-1001] * (new_partitions - self.npartitions))
+                    self.npartitions = new_partitions
+
+            for partition in range(self.npartitions):
+                tp = ck.TopicPartition(self.topic, partition, 0)
+                try:
+                    low, high = self.consumer.get_watermark_offsets(
+                        tp, timeout=0.1)
+                except (RuntimeError, ck.KafkaException):
+                    continue
+                self.started = True
+                if 'auto.offset.reset' in self.consumer_params.keys():
+                    if self.consumer_params['auto.offset.reset'] == 'latest' and \
+                            self.positions[partition] == -1001:
+                        self.positions[partition] = high
+                current_position = self.positions[partition]
+                lowest = max(current_position, low)
+                if high > lowest + self.max_batch_size:
+                    high = lowest + self.max_batch_size
+                if high > lowest:
+                    out.append((self.consumer_params, self.topic, partition,
+                                self.keys, lowest, high - 1))
+                    self.positions[partition] = high
+            self.consumer_params['auto.offset.reset'] = 'earliest'
+
+            if (out):
+                for part in out:
+                    def commit(_):
+                        topic, part_no, _, _, offset = part[1:]
+                        _tp = ck.TopicPartition(topic, part_no, offset + 1)
+                        self.consumer.commit(offsets=[_tp], asynchronous=True)
+
+                    # Create a future so we can add a done callback to commit the message
+                    part_future = asyncio.ensure_future(self._emit(part))
+                    part_future.add_done_callback(commit)
+
+                    yield part_future
+
+            else:
+                await asyncio.sleep(self.poll_interval)
+
+    async def _on_completed(self):
+        if (self.consumer is not None):
+            _close_consumer(self.consumer)
+            self.consumer = None
 
     async def _run(self):
         import confluent_kafka as ck
@@ -844,8 +980,12 @@ class from_iterable(Source):
         self._iterable = iterable
         super().__init__(**kwargs)
 
-    async def _get_iterable(self):
-        return self._iterable
+    async def _source_generator(self):
+        async for x in self._iterable:
+            yield self._emit(x)
+
+            if (self.stopped):
+                break
 
     async def run(self):
         for x in self._iterable:
@@ -853,74 +993,3 @@ class from_iterable(Source):
                 break
             await asyncio.gather(*self._emit(x))
         self.stopped = True
-
-    async def start_task(self, parallel_level = 10):
-
-        running_tasks = deque(maxlen=parallel_level)
-
-        self.stopped = False
-        self.started = True
-
-        iterator = iter(self._iterable)
-
-        while (not self.stopped):
-
-            try:
-                # Get next iterable value
-                next_val = next(iterator)
-            except StopIteration:
-                break
-
-            # Schedule the emit
-            running_tasks.append(asyncio.ensure_future(self._emit(next_val)))
-
-            # Pop off the queue
-            if (len(running_tasks) == parallel_level):
-                front_future = running_tasks.popleft()
-
-                # Finally await the future
-                await front_future
-
-        # Now finish up the outstanding
-        while (len(running_tasks) > 0):
-            front_future = running_tasks.popleft()
-
-            # Finally await the future
-            await front_future
-
-    async def gen_task2(self, q: asyncio.Queue):
-
-        iterator = iter(self._iterable)
-
-        while (not self.stopped):
-
-            try:
-                # Get next iterable value
-                next_val = next(iterator)
-            except StopIteration:
-                break
-
-            await q.put(asyncio.ensure_future(self._emit(next_val)))
-
-        self.stopped = True
-
-    async def start_task2(self, parallel_level = 10):
-
-        q = asyncio.Queue(maxsize=parallel_level)
-
-        self.stopped = False
-        self.started = True
-
-        asyncio.create_task(self.gen_task2(q))
-
-        while (not self.stopped):
-
-            next_future = await q.get()
-
-            await next_future
-
-        # Now finish up the outstanding
-        while (not q.empty()):
-            next_future = await q.get()
-
-            await next_future
