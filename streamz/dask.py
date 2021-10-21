@@ -4,7 +4,7 @@ from operator import getitem
 
 from tornado import gen
 
-from dask.compatibility import apply
+from dask.utils import apply
 from distributed.client import default_client
 import distributed
 from tqdm.std import tqdm
@@ -80,7 +80,7 @@ class filter(DaskStream):
 
         try:
             self._retain_refs(metadata)
-            
+
             result = yield client.submit(self.predicate, x, *self.args, **self.kwargs)
 
             if result:
