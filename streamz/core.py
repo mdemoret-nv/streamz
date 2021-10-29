@@ -4,6 +4,7 @@ from collections import deque, defaultdict
 from datetime import timedelta
 import functools
 import logging
+import os
 import six
 import sys
 import threading
@@ -636,14 +637,29 @@ class Stream(APIRegisterMixin):
         from .batch import Batch
         return Batch(stream=self, **kwargs)
 
-    def on_complete(self):
+    # Called when upstreams have completed. Ensure all outstanding messages have finished before completing
+    async def _on_completed(self):
 
+        assert self._ref_count <= 0, "Not all messages have completed!"
+
+        # Call any callbacks
         for cb in self._done_callbacks:
             cb(self)
 
-        # Decrement all downstreams to trigger possibility of being complete
-        for d in self.downstreams:
-            d._release_refs([])
+        # Trigger all downstreams
+        downstream_completes = [d._on_completed() for d in self.downstreams]
+
+        # Dont return until complete
+        await asyncio.gather(*downstream_completes)
+
+    # async def on_complete(self):
+
+    #     for cb in self._done_callbacks:
+    #         cb(self)
+
+    #     # Decrement all downstreams to trigger possibility of being complete
+    #     for d in self.downstreams:
+    #         d._release_refs([])
 
     def _retain_refs(self, metadata, n=1, ref_count=None):
         """ Retain all references in the provided metadata `n` number of times
@@ -1642,6 +1658,13 @@ class flatten(Stream):
     --------
     partition
     """
+    def __init__(self, upstream, max_concurrent=None, **kwargs):
+
+        # Limits how many can be in flight at one time
+        self.max_concurrent = os.cpu_count() if max_concurrent is None else max_concurrent
+
+        Stream.__init__(self, upstream, **kwargs)
+
     async def update(self, x, who=None, metadata=None):
         L = []
         for i, item in enumerate(x):
@@ -1650,7 +1673,18 @@ class flatten(Stream):
             else:
                 L.append(self._emit(item))
 
-        return await asyncio.gather(*L)
+        for i in range(0, len(L), self.max_concurrent):
+            x = list(L[i:i + self.max_concurrent])
+
+            await asyncio.gather(*x)
+
+        # if (self._preserve_order):
+        #     for x in L:
+        #         await x
+        # else:
+        #     # Run all at once if order isnt important
+        #     return await asyncio.gather(*L)
+
 
 
 @Stream.register_api()

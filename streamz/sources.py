@@ -125,10 +125,6 @@ class Source(Stream):
 
             await self._on_completed()
 
-    # Called when all emitted futures have completed
-    async def _on_completed(self):
-        pass
-
     def is_done(self):
         return self.started and self.stopped
 
